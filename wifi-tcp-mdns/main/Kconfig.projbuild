@@ -67,3 +67,18 @@ menu "WiFi Configuration"
     endchoice
 
 endmenu
+
+menu "TCP Server Configuration"
+    config ESP_SERVER_IP
+        string "IP"
+        default "172.31.99.230"
+        help
+            IP address of the TCP server for the client to connect to.
+
+    config ESP_SERVER_PORT
+        int "Port"
+        range 0 65535
+        default 8888
+        help
+            Port number of the TCP server for the client to connect to.
+endmenu
