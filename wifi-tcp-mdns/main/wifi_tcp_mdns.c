@@ -68,8 +68,42 @@ static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "wifi station";
 
 static int s_retry_num = 0;
+static TaskHandle_t s_tcp_client_task_handle = NULL;
 
 extern void tcp_client(void);
+
+static void tcp_client_task(void *pvParameters)
+{
+    (void)pvParameters;
+    tcp_client();
+    s_tcp_client_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void stop_tcp_client_task(void)
+{
+    if (s_tcp_client_task_handle != NULL) {
+        vTaskDelete(s_tcp_client_task_handle);
+        s_tcp_client_task_handle = NULL;
+        //ESP_LOGI(TAG, "tcp client task stopped");
+    }
+}
+
+static void start_tcp_client_task(void)
+{
+    BaseType_t created = xTaskCreate(tcp_client_task,
+                                     "tcp_client",
+                                     4096,
+                                     NULL,
+                                     5,
+                                     &s_tcp_client_task_handle);
+    if (created != pdPASS) {
+        s_tcp_client_task_handle = NULL;
+        //ESP_LOGE(TAG, "failed to create tcp client task");
+    } else {
+        //ESP_LOGI(TAG, "tcp client task started");
+    }
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -77,19 +111,19 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI(TAG,"connect to the AP fail");
+        stop_tcp_client_task();
+
+        esp_wifi_connect();
+        s_retry_num++;
+        //ESP_LOGI(TAG, "wifi disconnected, retry #%d", s_retry_num);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        //ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        stop_tcp_client_task();
+        start_tcp_client_task();
     }
 }
 
@@ -139,26 +173,22 @@ void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
     ESP_ERROR_CHECK(esp_wifi_start() );
 
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
+    //ESP_LOGI(TAG, "wifi_init_sta finished.");
 
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+        /* Wait until the first successful WiFi connection; reconnect handling continues in event_handler(). */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            WIFI_CONNECTED_BIT,
             pdFALSE,
-            pdFALSE,
+            pdTRUE,
             portMAX_DELAY);
 
     /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
      * happened. */
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+        // ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
+        //          EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
     } else {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        //ESP_LOGE(TAG, "UNEXPECTED EVENT");
     }
 }
 
@@ -178,8 +208,6 @@ void app_main(void)
         esp_log_level_set("wifi", CONFIG_LOG_MAXIMUM_LEVEL);
     }
 
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+    //ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
     wifi_init_sta();
-
-    tcp_client();
 }
