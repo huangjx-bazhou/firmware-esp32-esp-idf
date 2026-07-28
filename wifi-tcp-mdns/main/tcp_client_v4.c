@@ -84,8 +84,8 @@ static esp_err_t bridge_uart_init(void)
 
     uart_vfs_dev_use_driver(BRIDGE_UART_PORT);
 
-    //uart_vfs_dev_port_set_rx_line_endings(BRIDGE_UART_PORT, ESP_LINE_ENDINGS_CRLF);
-    //uart_vfs_dev_port_set_tx_line_endings(BRIDGE_UART_PORT, ESP_LINE_ENDINGS_CRLF);
+    uart_vfs_dev_port_set_rx_line_endings(BRIDGE_UART_PORT, ESP_LINE_ENDINGS_LF);
+    uart_vfs_dev_port_set_tx_line_endings(BRIDGE_UART_PORT, ESP_LINE_ENDINGS_LF);
 
     char uart_path[16] = {0};
     int path_len = snprintf(uart_path, sizeof(uart_path), "/dev/uart/%d", (int)BRIDGE_UART_PORT);

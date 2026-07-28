@@ -18,6 +18,7 @@
 
 #include "lwip/err.h"
 #include "lwip/sys.h"
+#include "lwip/ip_addr.h"
 
 /* The examples use WiFi configuration that you can set via project configuration menu
 
@@ -134,7 +135,15 @@ void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_netif_init());
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    esp_netif_ip_info_t ip_info;
+    memset(&ip_info, 0 , sizeof(esp_netif_ip_info_t));
+    ip_info.ip.addr = ipaddr_addr("172.31.99.102");
+    ip_info.netmask.addr = ipaddr_addr("255.255.255.0");
+    ip_info.gw.addr = ipaddr_addr("172.31.99.1");
+    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
