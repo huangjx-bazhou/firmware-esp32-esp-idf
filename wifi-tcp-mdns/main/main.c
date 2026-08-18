@@ -52,21 +52,30 @@
 #define UART_EVT_QUEUE_SIZE 32
 #define UART_EVT_TASK_STACK 4096
 #define UART_EVT_TASK_PRIO 9
-#define UART_RINGBUF_SIZE (1024 * 16) // 16KB的环形缓冲区
+#define UART_TX_TASK_STACK 4096
+#define UART_TX_TASK_PRIO 9
+#define UART_TCP_RINGBUF_SIZE (1024 * 16) // 16KB的环形缓冲区
 #define TCP_CONNECT_TASK_STACK 4096
 #define TCP_CONNECT_TASK_PRIO 8
 #define TCP_RETRY_DELAY_MS 2000
 #define TCP_CONNECT_TRIGGER_BIT BIT0
 #define TCP_SEND_TASK_STACK 4096
 #define TCP_SEND_TASK_PRIO 8
+#define TCP_RECV_TASK_STACK 4096
+#define TCP_RECV_TASK_PRIO 8
 #define TCP_SOCKET_QUEUE_LEN 1
+#define TCP_UART_RINGBUF_SIZE (1024 * 1) // 1KB的环形缓冲区
 
 static QueueHandle_t uart_event_queue = NULL;
 static RingbufHandle_t uart_tcp_ringbuf = NULL;
+static RingbufHandle_t tcp_uart_ringbuf = NULL;
+static TaskHandle_t uart_tx_task_handle = NULL;
 static TaskHandle_t tcp_connect_task_handle = NULL;
 static TaskHandle_t tcp_send_task_handle = NULL;
+static TaskHandle_t tcp_recv_task_handle = NULL;
 static EventGroupHandle_t tcp_connect_event_group = NULL;
-static QueueHandle_t tcp_socket_queue = NULL;
+static QueueHandle_t tcp_send_socket_queue = NULL;
+static QueueHandle_t tcp_recv_socket_queue = NULL;
 
 /**
  * @brief UART事件处理任务
@@ -113,6 +122,35 @@ static void uart_event_task(void *arg) {
   }
 }
 
+/**
+ * @brief UART发送任务
+ * @param arg 任务参数
+ */
+static void uart_tx_task(void *arg) {
+  (void)arg;
+
+  while (1) {
+    size_t item_len = 0;
+    uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(
+        tcp_uart_ringbuf, &item_len, portMAX_DELAY, 512);
+    if (NULL == item) {
+      continue;
+    }
+
+    size_t written = 0;
+    while (written < item_len) {
+      int n = uart_write_bytes(UART_NUM_0, (const char *)item + written,
+                               item_len - written);
+      if (n <= 0) {
+        break;
+      }
+      written += (size_t)n;
+    }
+
+    vRingbufferReturnItem(tcp_uart_ringbuf, item);
+  }
+}
+
 /*
  * @brief 初始化UART
  */
@@ -128,19 +166,20 @@ static void uart_init() {
                                .parity = UART_PARITY_DISABLE,
                                .stop_bits = UART_STOP_BITS_1,
                                .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-                               .rx_flow_ctrl_thresh =
-                                   UART_HW_FIFO_LEN(UART_NUM_0),
+                               .rx_flow_ctrl_thresh = 0,
                                .source_clk = UART_SCLK_DEFAULT,
                                .flags = {.allow_pd = 1}};
-  ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &uart_config));
 
-  uart_tcp_ringbuf = xRingbufferCreate(UART_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
-  if (NULL == uart_tcp_ringbuf) {
-    esp_restart();
-  }
+  ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &uart_config));
 
   if (xTaskCreate(uart_event_task, "uart_event_task", UART_EVT_TASK_STACK, NULL,
                   UART_EVT_TASK_PRIO, NULL) != pdPASS) {
+    esp_restart();
+  }
+
+  if (xTaskCreate(uart_tx_task, "uart_tx_task", UART_TX_TASK_STACK, NULL,
+                  UART_TX_TASK_PRIO, &uart_tx_task_handle) != pdPASS) {
+    uart_tx_task_handle = NULL;
     esp_restart();
   }
 }
@@ -154,7 +193,7 @@ static void tcp_send_task(void *arg) {
 
   while (1) {
     // 等待socket描述符从队列中发送过来
-    if (pdTRUE != xQueueReceive(tcp_socket_queue, &sock, portMAX_DELAY)) {
+    if (pdTRUE != xQueueReceive(tcp_send_socket_queue, &sock, portMAX_DELAY)) {
       continue;
     }
 
@@ -182,6 +221,33 @@ static void tcp_send_task(void *arg) {
     }
 
   wait_next_socket:;
+  }
+}
+
+/**
+ * @brief TCP接收任务
+ */
+static void tcp_recv_task(void *arg) {
+  (void)arg;
+  int sock = -1;
+  uint8_t data[512];
+
+  while (1) {
+    if (pdTRUE != xQueueReceive(tcp_recv_socket_queue, &sock, portMAX_DELAY)) {
+      continue;
+    }
+
+    while (1) {
+      int len = recv(sock, data, sizeof(data), 0);
+      if (len <= 0) {
+        close(sock);
+        sock = -1;
+        xEventGroupSetBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
+        break;
+      }
+
+      xRingbufferSend(tcp_uart_ringbuf, data, (size_t)len, 0);
+    }
   }
 }
 
@@ -216,13 +282,25 @@ static void tcp_connect_task(void *arg) {
       int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
       if (0 == err) {
-        // 连接成功,清空队列并发送新的socket描述符
-        // TODO: 如果有旧的socket描述符在队列中，这时该怎么处理？
-        xQueueReset(tcp_socket_queue);
+        int send_sock = sock;
+        int recv_sock = sock;
 
-        // 发送新的socket描述符到队列中
-        // TODO: 发送失败该怎么办
-        xQueueSend(tcp_socket_queue, &sock, portMAX_DELAY);
+        xQueueReset(tcp_send_socket_queue);
+        xQueueReset(tcp_recv_socket_queue);
+
+        if (pdTRUE != xQueueSend(tcp_send_socket_queue, &send_sock,
+                                 pdMS_TO_TICKS(1000))) {
+          close(sock);
+          vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
+          continue;
+        }
+
+        if (pdTRUE != xQueueSend(tcp_recv_socket_queue, &recv_sock,
+                                 pdMS_TO_TICKS(1000))) {
+          close(sock);
+          vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
+          continue;
+        }
 
         break;
       }
@@ -368,9 +446,15 @@ static void wifi_init_sta(void) {
     esp_restart();
   }
 
-  // Create TCP socket queue
-  tcp_socket_queue = xQueueCreate(TCP_SOCKET_QUEUE_LEN, sizeof(int));
-  if (NULL == tcp_socket_queue) {
+  // Create TCP send socket queue
+  tcp_send_socket_queue = xQueueCreate(TCP_SOCKET_QUEUE_LEN, sizeof(int));
+  if (NULL == tcp_send_socket_queue) {
+    esp_restart();
+  }
+
+  // Create TCP receive socket queue
+  tcp_recv_socket_queue = xQueueCreate(TCP_SOCKET_QUEUE_LEN, sizeof(int));
+  if (NULL == tcp_recv_socket_queue) {
     esp_restart();
   }
 
@@ -378,6 +462,13 @@ static void wifi_init_sta(void) {
   if (pdPASS != xTaskCreate(tcp_send_task, "tcp_send_task", TCP_SEND_TASK_STACK,
                             NULL, TCP_SEND_TASK_PRIO, &tcp_send_task_handle)) {
     tcp_send_task_handle = NULL;
+    esp_restart();
+  }
+
+  // Create TCP receive task
+  if (pdPASS != xTaskCreate(tcp_recv_task, "tcp_recv_task", TCP_RECV_TASK_STACK,
+                            NULL, TCP_RECV_TASK_PRIO, &tcp_recv_task_handle)) {
+    tcp_recv_task_handle = NULL;
     esp_restart();
   }
 
@@ -416,6 +507,18 @@ void app_main(void) {
 
   // Initialize default event loop (shared by all components)
   ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+  uart_tcp_ringbuf =
+      xRingbufferCreate(UART_TCP_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
+  if (NULL == uart_tcp_ringbuf) {
+    esp_restart();
+  }
+
+  tcp_uart_ringbuf =
+      xRingbufferCreate(TCP_UART_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
+  if (NULL == tcp_uart_ringbuf) {
+    esp_restart();
+  }
 
   // Initialize UART
   uart_init();
