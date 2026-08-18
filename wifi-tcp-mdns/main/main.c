@@ -210,6 +210,7 @@ static void tcp_send_task(void *arg) {
         int n = send(sock, item + sent, item_len - sent, 0);
         if (n <= 0) {
           vRingbufferReturnItem(uart_tcp_ringbuf, item);
+          shutdown(sock, SHUT_RDWR);
           close(sock);
           sock = -1;
           goto wait_next_socket;
@@ -239,7 +240,11 @@ static void tcp_recv_task(void *arg) {
 
     while (1) {
       int len = recv(sock, data, sizeof(data), 0);
+
+      ESP_LOGI(__func__, "TCP received data, sock=%d, len=%d", sock, len);
+
       if (len <= 0) {
+        shutdown(sock, SHUT_RDWR);
         close(sock);
         sock = -1;
         xEventGroupSetBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
@@ -259,29 +264,34 @@ static void tcp_connect_task(void *arg) {
 
   while (1) {
     xEventGroupWaitBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT,
-                        pdFALSE, pdFALSE, portMAX_DELAY);
+                        pdTRUE, pdFALSE, portMAX_DELAY);
 
-    struct sockaddr_in dest_addr = {0};
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(CONFIG_ESP_SERVER_PORT);
-    if (inet_pton(AF_INET, CONFIG_ESP_SERVER_IP, &dest_addr.sin_addr) != 1) {
-      vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
-      continue;
-    }
+    ESP_LOGI(__func__, "TCP connect triggered");
 
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0) {
-      vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
-      continue;
-    }
-
-    xEventGroupClearBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
-
-    // 创建socket成功，循环连接
+    // 循环创建，连接
     while (1) {
+      struct sockaddr_in dest_addr = {0};
+      dest_addr.sin_family = AF_INET;
+      dest_addr.sin_port = htons(CONFIG_ESP_SERVER_PORT);
+      if (inet_pton(AF_INET, CONFIG_ESP_SERVER_IP, &dest_addr.sin_addr) != 1) {
+        vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
+        continue;
+      }
+
+      int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+      if (sock < 0) {
+        vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
+        continue;
+      }
+
+      ESP_LOGI(__func__, "Created socket, connecting to %s:%d",
+               CONFIG_ESP_SERVER_IP, CONFIG_ESP_SERVER_PORT);
+
       int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
       if (0 == err) {
+        ESP_LOGI(__func__, "TCP connected, sock=%d", sock);
+
         int send_sock = sock;
         int recv_sock = sock;
 
@@ -290,6 +300,7 @@ static void tcp_connect_task(void *arg) {
 
         if (pdTRUE != xQueueSend(tcp_send_socket_queue, &send_sock,
                                  pdMS_TO_TICKS(1000))) {
+          shutdown(sock, SHUT_RDWR);
           close(sock);
           vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
           continue;
@@ -297,6 +308,7 @@ static void tcp_connect_task(void *arg) {
 
         if (pdTRUE != xQueueSend(tcp_recv_socket_queue, &recv_sock,
                                  pdMS_TO_TICKS(1000))) {
+          shutdown(sock, SHUT_RDWR);
           close(sock);
           vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
           continue;
@@ -304,6 +316,12 @@ static void tcp_connect_task(void *arg) {
 
         break;
       }
+
+      shutdown(sock, SHUT_RDWR);
+      close(sock);
+
+      // 打印连接失败原因
+      ESP_LOGW(__func__, "TCP connect failed, sock=%d, err=%d", sock, errno);
 
       // 连接失败，等待一段时间后重试
       vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
