@@ -1,8 +1,8 @@
-#include "esp_system.h"
 #include <arpa/inet.h>
 #include <driver/uart.h>
 #include <esp_event.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 #include <freertos/event_groups.h>
 #include <freertos/queue.h>
@@ -10,7 +10,9 @@
 #include <freertos/task.h>
 #include <hal/uart_types.h>
 #include <nvs_flash.h>
+#include <stdatomic.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -69,6 +71,7 @@
 static QueueHandle_t uart_event_queue = NULL;
 static RingbufHandle_t uart_tcp_ringbuf = NULL;
 static RingbufHandle_t tcp_uart_ringbuf = NULL;
+static TaskHandle_t uart_event_task_handle = NULL;
 static TaskHandle_t uart_tx_task_handle = NULL;
 static TaskHandle_t tcp_connect_task_handle = NULL;
 static TaskHandle_t tcp_send_task_handle = NULL;
@@ -76,6 +79,7 @@ static TaskHandle_t tcp_recv_task_handle = NULL;
 static EventGroupHandle_t tcp_connect_event_group = NULL;
 static QueueHandle_t tcp_send_socket_queue = NULL;
 static QueueHandle_t tcp_recv_socket_queue = NULL;
+static atomic_int socket_atomic = -1;
 
 /**
  * @brief UART事件处理任务
@@ -94,9 +98,11 @@ static void uart_event_task(void *arg) {
 
     // 处理UART事件
     switch (event.type) {
-    case UART_DATA: { // Rx Ring Buffer 有数据到来
+    case UART_DATA: { // UART Rx Ring Buffer 有数据到来
       // 接收缓冲区中的数据个数
       size_t remain = event.size;
+
+      ESP_LOGI(__func__, "UART received data, size=%d", remain);
 
       // 循环读取
       while (remain > 0) {
@@ -108,15 +114,45 @@ static void uart_event_task(void *arg) {
         xRingbufferSend(uart_tcp_ringbuf, data, len, 0);
         remain -= len;
       }
+
       break;
     }
-    case UART_FIFO_OVF:    // Rx FIFO溢出
-    case UART_BUFFER_FULL: // Rx Ring Buffer满
-      // 如果硬件FIFO溢出或接收缓冲区满，等待发送完毕，清空UART的缓冲区，这时接收缓冲区数据丢失
-      uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(100));
-      uart_flush(UART_NUM_0);
+    case UART_FIFO_OVF:    // UART Rx FIFO溢出
+    case UART_BUFFER_FULL: // UART Rx Ring Buffer满
+
+      if (UART_BUFFER_FULL == event.type) {
+        ESP_LOGW(__func__, "UART RX ring buffer full");
+      } else {
+        ESP_LOGW(__func__, "UART RX FIFO overflow");
+      }
+
+      size_t buffered_data_len = 0;
+      if (ESP_OK ==
+          uart_get_buffered_data_len(UART_NUM_0, &buffered_data_len)) {
+        ESP_LOGI(__func__, "UART buffered data length: %d", buffered_data_len);
+
+        // 循环读取
+        // TODO:
+        // 这里的循环读取跟上面的UART_DATA事件处理逻辑重复了，可以考虑写一个函数复用
+        // TODO:
+        // 是否可以直接读到环形缓冲区，而不是先读到data数组再发送到环形缓冲区
+        while (buffered_data_len > 0) {
+          size_t to_read = buffered_data_len > sizeof(data) ? sizeof(data)
+                                                            : buffered_data_len;
+          int len = uart_read_bytes(UART_NUM_0, data, to_read, 0);
+          if (len <= 0) {
+            break;
+          }
+          xRingbufferSend(uart_tcp_ringbuf, data, len, 0);
+          buffered_data_len -= len;
+        }
+      } else {
+        ESP_LOGW(__func__, "Failed to get UART buffered data length");
+      }
+
       break;
     default:
+      // TODO: 处理其他事件类型，如UART_BREAK, UART_PARITY_ERR, UART_FRAME_ERR等
       break;
     }
   }
@@ -137,6 +173,8 @@ static void uart_tx_task(void *arg) {
       continue;
     }
 
+    ESP_LOGI(__func__, "UART TX task received data, size=%d", item_len);
+
     size_t written = 0;
     while (written < item_len) {
       int n = uart_write_bytes(UART_NUM_0, (const char *)item + written,
@@ -144,7 +182,7 @@ static void uart_tx_task(void *arg) {
       if (n <= 0) {
         break;
       }
-      written += (size_t)n;
+      written += n;
     }
 
     vRingbufferReturnItem(tcp_uart_ringbuf, item);
@@ -172,13 +210,15 @@ static void uart_init() {
 
   ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &uart_config));
 
-  if (xTaskCreate(uart_event_task, "uart_event_task", UART_EVT_TASK_STACK, NULL,
-                  UART_EVT_TASK_PRIO, NULL) != pdPASS) {
+  if (pdPASS != xTaskCreate(uart_event_task, "uart_event_task",
+                            UART_EVT_TASK_STACK, NULL, UART_EVT_TASK_PRIO,
+                            &uart_event_task_handle)) {
+    uart_event_task_handle = NULL;
     esp_restart();
   }
 
-  if (xTaskCreate(uart_tx_task, "uart_tx_task", UART_TX_TASK_STACK, NULL,
-                  UART_TX_TASK_PRIO, &uart_tx_task_handle) != pdPASS) {
+  if (pdPASS != xTaskCreate(uart_tx_task, "uart_tx_task", UART_TX_TASK_STACK,
+                            NULL, UART_TX_TASK_PRIO, &uart_tx_task_handle)) {
     uart_tx_task_handle = NULL;
     esp_restart();
   }
@@ -205,6 +245,8 @@ static void tcp_send_task(void *arg) {
         continue;
       }
 
+      ESP_LOGI(__func__, "TCP sending data, sock=%d, len=%d", sock, item_len);
+
       size_t sent = 0;
       while (sent < item_len) {
         int n = send(sock, item + sent, item_len - sent, 0);
@@ -213,15 +255,18 @@ static void tcp_send_task(void *arg) {
           shutdown(sock, SHUT_RDWR);
           close(sock);
           sock = -1;
-          goto wait_next_socket;
+          xEventGroupSetBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
+          break;
         }
         sent += n;
       }
 
       vRingbufferReturnItem(uart_tcp_ringbuf, item);
-    }
 
-  wait_next_socket:;
+      if (sock < 0) {
+        break;
+      }
+    }
   }
 }
 
@@ -264,9 +309,11 @@ static void tcp_connect_task(void *arg) {
 
   while (1) {
     xEventGroupWaitBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT,
-                        pdTRUE, pdFALSE, portMAX_DELAY);
+                        pdFALSE, pdFALSE, portMAX_DELAY);
 
     ESP_LOGI(__func__, "TCP connect triggered");
+
+    atomic_store(&socket_atomic, -1);
 
     // 循环创建，连接
     while (1) {
@@ -313,6 +360,10 @@ static void tcp_connect_task(void *arg) {
           vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
           continue;
         }
+
+        xEventGroupClearBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
+
+        atomic_store(&socket_atomic, sock);
 
         break;
       }
@@ -380,12 +431,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
  */
 static void sta_got_ip_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data) {
-  /// TODO: 通知MCU已获取IP地址
 
   ip_event_got_ip_t *got_ip_event_data = (ip_event_got_ip_t *)event_data;
   ESP_LOGI(__func__, "ip_changed: %d", got_ip_event_data->ip_changed);
 
-  xEventGroupSetBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
+  int sock = atomic_load(&socket_atomic);
+  if (sock < 0) {
+    xEventGroupSetBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
+  }
 }
 
 /**
@@ -394,8 +447,6 @@ static void sta_got_ip_handler(void *arg, esp_event_base_t event_base,
 static void sta_lost_ip_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data) {
   ESP_LOGI(__func__, "lost address");
-  xEventGroupClearBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
-  /// TODO: 通知MCU已丢失IP地址
 }
 
 /**
@@ -526,12 +577,14 @@ void app_main(void) {
   // Initialize default event loop (shared by all components)
   ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+  // Create ring buffer for UART-TCP communication
   uart_tcp_ringbuf =
       xRingbufferCreate(UART_TCP_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
   if (NULL == uart_tcp_ringbuf) {
     esp_restart();
   }
 
+  // Create ring buffer for TCP-UART communication
   tcp_uart_ringbuf =
       xRingbufferCreate(TCP_UART_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
   if (NULL == tcp_uart_ringbuf) {
