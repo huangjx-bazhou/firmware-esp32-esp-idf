@@ -237,6 +237,8 @@ static void tcp_send_task(void *arg) {
       continue;
     }
 
+    ESP_LOGI(__func__, "TCP send task got socket: %d", sock);
+
     while (1) {
       size_t item_len = 0;
       uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(
@@ -251,14 +253,12 @@ static void tcp_send_task(void *arg) {
       while (sent < item_len) {
         int n = send(sock, item + sent, item_len - sent, 0);
         if (n <= 0) {
-          vRingbufferReturnItem(uart_tcp_ringbuf, item);
-          shutdown(sock, SHUT_RDWR);
-          close(sock);
           sock = -1;
           xEventGroupSetBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
           break;
+        } else {
+          sent += n;
         }
-        sent += n;
       }
 
       vRingbufferReturnItem(uart_tcp_ringbuf, item);
@@ -283,20 +283,20 @@ static void tcp_recv_task(void *arg) {
       continue;
     }
 
+    ESP_LOGI(__func__, "TCP recv task got socket: %d", sock);
+
     while (1) {
       int len = recv(sock, data, sizeof(data), 0);
 
       ESP_LOGI(__func__, "TCP received data, sock=%d, len=%d", sock, len);
 
       if (len <= 0) {
-        shutdown(sock, SHUT_RDWR);
-        close(sock);
         sock = -1;
         xEventGroupSetBits(tcp_connect_event_group, TCP_CONNECT_TRIGGER_BIT);
         break;
+      } else {
+        xRingbufferSend(tcp_uart_ringbuf, data, len, 0);
       }
-
-      xRingbufferSend(tcp_uart_ringbuf, data, (size_t)len, 0);
     }
   }
 }
@@ -313,6 +313,14 @@ static void tcp_connect_task(void *arg) {
 
     ESP_LOGI(__func__, "TCP connect triggered");
 
+    int sock = atomic_load(&socket_atomic);
+
+    if (sock >= 0) {
+      ESP_LOGI(__func__, "Closing existing socket: %d", sock);
+      shutdown(sock, SHUT_RDWR);
+      close(sock);
+    }
+
     atomic_store(&socket_atomic, -1);
 
     // 循环创建，连接
@@ -325,7 +333,7 @@ static void tcp_connect_task(void *arg) {
         continue;
       }
 
-      int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+      sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
       if (sock < 0) {
         vTaskDelay(pdMS_TO_TICKS(TCP_RETRY_DELAY_MS));
         continue;
@@ -566,13 +574,13 @@ void app_main(void) {
   // Configure dynamic frequency scaling:
   // maximum and minimum frequencies are set in sdkconfig,
   // automatic light sleep is enabled if tickless idle support is enabled.
-#if CONFIG_PM_ENABLE & CONFIG_FREERTOS_USE_TICKLESS_IDLE
+#if CONFIG_PM_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE
   esp_pm_config_t pm_config;
   if (ESP_OK == esp_pm_get_configuration(&pm_config)) {
     pm_config.light_sleep_enable = true;
     esp_pm_configure(&pm_config);
   }
-#endif // CONFIG_PM_ENABLE & CONFIG_FREERTOS_USE_TICKLESS_IDLE
+#endif // CONFIG_PM_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE
 
   // Initialize default event loop (shared by all components)
   ESP_ERROR_CHECK(esp_event_loop_create_default());
